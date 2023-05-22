@@ -1,7 +1,7 @@
 import PocketBase, { Record } from 'pocketbase';
-import { z } from 'zod';
+import { TypeOf, z } from 'zod';
 
-const kanji = z.object({
+const kanjiSchema = z.object({
     character: z.string().length(1),
     ranking: z.number().int(),
     onyomi: z.array(z.string()),
@@ -9,15 +9,15 @@ const kanji = z.object({
     meanings: z.array(z.string()),
 });
 
-const vocab = z.object({
+const vocabSchema = z.object({
     term: z.string(),
     ranking: z.number(),
     readings: z.array(z.string()),
     meanings: z.array(z.string()),
-    kanji: z.array(kanji),
+    kanji: z.array(kanjiSchema),
 });
 
-const review = z.object({
+const reviewSchema = z.object({
     term_type: z.enum([ 'kanji', 'vocab' ]),
     term_id: z.string(),
     user: z.string(),
@@ -30,29 +30,155 @@ const review = z.object({
     }),
 });
 
-export type Kanji = z.infer<typeof kanji>;
-export type Vocab = z.infer<typeof vocab>;
-export type Review = z.infer<typeof review>;
+export type Kanji = {
+    id: string,
+    character: string,
+    ranking: number,
+    onyomi: string[],
+    kunyomi: string[],
+    meanings: string[],
+}
+
+export type Vocab = {
+    id: string,
+    term: string,
+    ranking: number,
+    readings: string[],
+    meanings: string[],
+    kanji: Kanji[],
+}
+
+export type User = {
+    id: string,
+    username: string,
+    email: string,
+    name: string,
+    avatar: string,
+    emailVisibility: string,
+}
+
+type PreReview<T extends Kanji | Vocab = Kanji | Vocab> = {
+    id: string,
+    term_type: 'vocab' | 'kanji',
+    level: number,
+    review_time: Date,
+    notes: {
+        readings: T extends Vocab ? 
+            string[] :
+            {
+                onyomi: string[],
+                kunyomi: string[]
+            },
+        meanings: string[],
+        other: string[]
+    }
+}
+
+export type Review<T extends Kanji | Vocab = Kanji | Vocab> = PreReview<T> & {
+    term: T,
+    user: User,
+}
+
+type DBReview<T extends Kanji | Vocab = Kanji | Vocab> = Record & PreReview<T> & {
+    term: string,
+    user: string,
+}
+
+export function matches(reading1: string, reading2: string) {
+    return reading1 === reading2;
+}
 
 export class ReviewSession {
     readonly pb: PocketBase;
 
-    current: Review[]
+    current: Review[] = [];
 
     constructor(pb: PocketBase) {
+        if (!pb.authStore.isValid) {
+            throw Error('PocketBase instance must be authenticated to create a review session');
+        }
+
         this.pb = pb;
     }
 
+    async fetch(amount: number = 5): Promise<Review[]> {
+        let reviewData = await this.pb.collection('reviews').getList<DBReview>(1, amount, {
+            filter: `review_time > ${Date.now()}`,
+            expand: 'user'
+        });
 
-}
+        let reviews: Review[] = await Promise.all(reviewData.items.map(async (item) => {
+            if (item.term_type === 'kanji') {
+                const user = item.expand.user as unknown as User;
+                const term = await this.pb.collection('kanji').getOne<Kanji>(item.term);
 
-export async function getReviews(pb: PocketBase, amount: number = 1): Promise<Review[]> {
-    if (!pb.authStore.isValid) {
-        return [];
+                const { id, term_type, level, review_time } = item;
+                const { notes } = item as DBReview<Kanji>;
+
+                const result: Review<Kanji> = {
+                    id,
+                    term_type,
+                    user,
+                    term,
+                    level,
+                    review_time,
+                    notes,
+                }
+
+                return result;
+            }
+            else {
+                const user = item.expand.user as unknown as User;
+                const term = await this.pb.collection('kanji').getOne<Vocab>(item.term);
+
+                const { id, term_type, level, review_time } = item;
+                const { notes } = item as DBReview<Vocab>;
+
+                const result: Review<Vocab> = {
+                    id,
+                    term_type,
+                    user,
+                    term,
+                    level,
+                    review_time,
+                    notes,
+                }
+                
+                return result;
+            }
+        }));
+
+        this.current = reviews;
+
+        return reviews;
     }
 
-    const data = await pb.collection('reviews').getFullList<Record & Review>({ expand: 'user' });
+    get() {
+        return this.current[0];
+    }
 
+    next(): Review | undefined {
+        return this.current.shift();
+    }
 
-    return expand(data);
-}
+    checkNextMeaning(guess: string): boolean {
+        const review = this.get();
+
+        return review.term.meanings.some(meaning => meaning === guess) || review.notes.meanings.some(meanings => meanings === guess);
+    }
+
+    checkNextReading(guess: string, type: 'onyomi' | 'kunyomi' = 'onyomi'): boolean {
+        const review = this.get();
+
+        if (review.term_type === 'vocab') { 
+            const vr = review as Review<Vocab>;
+
+            return vr.term.readings.some(reading => matches(reading, guess)) || vr.notes.readings.some(reading => matches(reading, guess));
+        }
+        else {
+            const kr = review as Review<Kanji>;
+
+            return kr.term[type].some(reading => matches(reading, guess)) || kr.notes.readings[type].some(reading => matches(reading, guess));
+        }
+    }
+} 
